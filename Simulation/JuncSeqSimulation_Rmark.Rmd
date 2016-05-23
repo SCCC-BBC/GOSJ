@@ -1,0 +1,296 @@
+---
+title: "JuncseqSimulation"
+output: 
+  html_document: 
+    fig_height: 10
+    fig_width: 10
+---
+
+#Bias correction for sub-features:
+```{r, echo=FALSE, message=FALSE}
+require(tweeDEseqCountData)
+require(edgeR)
+require(goseq)
+require(DESeq2)
+require(multtest)
+require(JunctionSeq)
+require(parallel) 
+require("ggplot2")
+source("/Users/yxb173/Desktop/Project/Other/CountSimulator/AdaptedCodes_juncbias.R")
+source("/Users/yxb173/Desktop/Project/Other/CountSimulator/goseq.2.R")
+
+#required functions
+# use DESeq diff test
+DESeq_2group.junc = function(Data, Sample_names1, Sample_names2){
+  cat(paste("Comparing", paste(Sample_names1,collapse = "+"), "(Treated)\n\tto", paste(Sample_names2,collapse = "+"), "(Untreated)\n"))
+  N_data = nrow(Data)
+  nsample1 = length(Sample_names1)
+  nsample2 = length(Sample_names2)
+  colID_select = match(c(Sample_names1,Sample_names2), colnames(Data))
+  Data_s = Data[, colID_select]
+  condition = factor(c(rep("Treated",nsample1),rep("Untreated",nsample2)))
+  dds = DESeqDataSetFromMatrix(Data_s, DataFrame(condition), ~ condition)
+  dds$condition = relevel(dds$condition, ref = "Untreated")
+  return(results(DESeq(dds)))
+}
+
+# ggplot sestting
+theme1 = theme(axis.text.x = element_text(size=20), 
+               axis.text.y = element_text(size=20),  panel.background =  element_rect(fill = "white", colour = NA), 
+               panel.border = element_rect(fill = NA, colour="grey50"), 
+               panel.grid.major =  element_line(colour = "grey90", size = 0.2),
+               panel.grid.minor =  element_line(colour = "grey98", size = 0.5),
+               panel.margin = unit(0.25, "lines")) 
+```
+
+##Simulation setup
+```{r}
+data(pickrell)
+pickrell = as.matrix(exprs(pickrell.eset))
+nSamp = 10
+nGenes = 2000
+nJunction_init = 100000
+max_junc = 60
+nPway = 250
+n_perm_pway = 10000
+fix_pwaysize = 15 # for scenario 2
+Pway_max_size = 100
+Pway_min_size = 15
+grp = as.factor(rep(0:1, each=nSamp/2))
+```
+```{r, echo=FALSE}
+#Assigning number of junctions to genes
+#prob.tmp = dexp(x=seq(from=0,to=8,length.out=max_junc), rate=1)
+prob.tmp = dlnorm(x=seq(from=0,to=8,length.out=max_junc), meanlog = 2, sdlog = 20)
+nJunc.rand = sample(1:max_junc, nGenes, replace=T, prob = prob.tmp)
+assigned.id = numeric()
+for(i in 1:nGenes){
+  if((length(assigned.id)+nJunc.rand[i])>nJunction_init){
+    break
+  }
+  assigned.id = c(assigned.id, rep(i, nJunc.rand[i]))
+}
+nJunction = length(assigned.id)
+```
+```{r, echo=FALSE, message=FALSE, results='hide'}
+# simulating counts
+data.sim = NBsim(foldDiff = 3, dataset = pickrell, nTags = nJunction, group = grp, verbose = TRUE, 
+                 add.outlier = F, outlierMech = "S", pOutlier = 0.2, drop.extreme.dispersion = 0.1, pDiff=0.1
+)
+data.sim.count = data.sim$counts
+colnames(data.sim.count) = c(paste0("Control_", 1:(nSamp/2)), paste0("Treated_", 1:(nSamp/2)))
+# calculate DE use DESeq2
+data.sim.DE = data.frame(DESeq_2group.junc(data.sim.count, paste0("Control_", 1:(nSamp/2)), paste0("Treated_", 1:(nSamp/2))))
+```
+Simulated data:
+```{r}
+head(data.sim.count)
+```
+
+Distribution of junction pvalue:
+
+```{r, echo=FALSE, fig.width=5, fig.height=5}
+hist(data.sim.DE$pvalue, breaks=30, xlab="Raw p value")
+```
+
+Distribution of number of junctions:
+
+```{r, echo=FALSE, fig.width=5, fig.height=5}
+hist(table(assigned.id), breaks=30, xlab="Number of junctions")
+```
+```{r, echo=FALSE}
+# function for obtaining data table with gene level DE and adjustment and other information
+# threshold
+p_junc_adj_th = 0.05
+p_GW_th = 0.05
+p_GW_subf_th = 0.05
+p_GW_FDRq = 0.05
+# function for proposed corrected pvalue
+Pval_adj_bias = function(minPval, N_junction, p_globe){
+  if(length(minPval)!=length(N_junction)){
+    stop("minPval and N_junction need to have same length!", .call=F)
+  }
+  res_padj= rep(1, length(minPval))
+  for(i in 1:length(minPval)){
+    res_padj[i] = (1-(1-length(which(p_globe<minPval[i])
+                                        )/length(na.omit(p_globe)))^N_junction[i])
+  }
+  res_padj
+}
+
+#----1. create DE dataset----#
+# match DE juncitons with genes assigned the junction
+gene.uid = unique(assigned.id)
+gene.DE = matrix(0,nrow=length(gene.uid), ncol=3)
+for (i in 1:length(gene.uid)){
+  junc.sim.id = which(assigned.id==gene.uid[i])
+  tmp.pvals = data.sim.DE$pvalue[junc.sim.id]
+  Njunc = length(na.omit(tmp.pvals))
+  if(all(is.na(tmp.pvals))){
+    minJuncPvalue = NA
+  }else if(length(na.omit(tmp.pvals))==1){
+    minJuncPvalue = na.omit(tmp.pvals)
+    minP.bh = na.omit(tmp.pvals)
+  }else{
+    # correct pval at junction level
+    pjunc.bh = mt.rawp2adjp(na.omit(tmp.pvals), "BH")
+    minP.bh = min(pjunc.bh$adjp[order(pjunc.bh$index),2], na.rm = T)
+    minJuncPvalue = min(tmp.pvals, na.rm = T)
+  }
+  gene.DE[i,] = t(c(minJuncPvalue, minP.bh, Njunc))
+}
+rownames(gene.DE) = paste0("gene_", gene.uid)
+colnames(gene.DE) = c("minJuncPvalue", "minP.bh", "Njunc")
+gene.DE = data.frame(gene.DE)
+gene.DE = gene.DE[which(!is.na(gene.DE$minJuncPvalue)),]
+cat("Total number of testable genes: ", nrow(gene.DE),"\n")
+```
+
+```{r, echo=FALSE}
+#Generate pathway data sets with two scenarios:
+#----- two sub-senario cases ----#
+# I. random pathways
+# randomly create a pathway datasets
+pway2gene = lapply(1:nPway,function(h)rownames(gene.DE)[sample(1:nrow(gene.DE), 
+                                                               sample(Pway_min_size:Pway_max_size,1))])
+names(pway2gene) = paste0("Pathway_", 1:nPway)
+gene2pway = reversemapping(pway2gene)
+
+# II. pathway with genes ranked by the number of junctions
+gene.DE.ordered = gene.DE[order(gene.DE$Njunc, decreasing = T), ]
+pway2gene.2 = lapply(1:floor(nrow(gene.DE.ordered)/fix_pwaysize), function(h)
+  if(h==floor(nrow(gene.DE.ordered)/fix_pwaysize)){
+    rownames(gene.DE.ordered)[((h-1)*fix_pwaysize+1):nrow(gene.DE.ordered)]
+  }else{
+    rownames(gene.DE.ordered)[((h-1)*fix_pwaysize+1):(h*fix_pwaysize)]
+  }
+)
+names(pway2gene.2) = paste0("Pathway_", 1:length(pway2gene.2))
+gene2pway.2 = reversemapping(pway2gene.2)
+```
+
+```{r, echo=FALSE, message=FALSE, results='hide', warning=FALSE}
+# method for correcting p value
+# 1. proposed method
+gene.DE$padjByNjunc = Pval_adj_bias(gene.DE$minJuncPvalue, gene.DE$Njunc, data.sim.DE$pvalue)
+gene.DE$DE_padjByNjunc = ifelse(gene.DE$padjByNjunc < p_junc_adj_th, 1, 0)
+
+pwf.padjByNjunc = makespline(gene.DE$Njunc, gene.DE$DE_padjByNjunc)
+gene.DE.pwf.padjByNjunc = data.frame(DEgenes = gene.DE$DE_padjByNjunc, bias.data = gene.DE$Njunc, pwf = pwf.padjByNjunc)
+rownames(gene.DE.pwf.padjByNjunc) = rownames(gene.DE)
+
+pway.padjByNjunc.sampling = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway, method="Sampling", repcnt= n_perm_pway) 
+pway.padjByNjunc.wallenius = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway, method="Wallenius") 
+pway.padjByNjunc.hypergeo = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway, method="Hypergeometric") 
+pway.2.padjByNjunc.sampling = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway.2, method="Sampling", repcnt= n_perm_pway) 
+pway.2.padjByNjunc.wallenius = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway.2, method="Wallenius") 
+pway.2.padjByNjunc.hypergeo = goseq(gene.DE.pwf.padjByNjunc, gene2cat=gene2pway.2, method="Hypergeometric") 
+
+gg.padjByNjunc.sampling = pwayEnrich_DEjunc(pway2gene, pway.padjByNjunc.sampling, gene.DE, TT="Proposed\nSampling")
+gg.padjByNjunc.wallenius = pwayEnrich_DEjunc(pway2gene, pway.padjByNjunc.wallenius, gene.DE, TT="Proposed\nWallenius")
+gg.padjByNjunc.hypergeo = pwayEnrich_DEjunc(pway2gene, pway.padjByNjunc.hypergeo, gene.DE, TT="Proposed\nHypergeo")
+gg.2.padjByNjunc.sampling = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjByNjunc.sampling, gene.DE, TT="Proposed\nSampling")
+gg.2.padjByNjunc.wallenius = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjByNjunc.wallenius, gene.DE, TT="Proposed\nWallenius")
+gg.2.padjByNjunc.hypergeo = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjByNjunc.hypergeo, gene.DE, TT="Proposed\nHypergeo")
+
+# 2. DESeq min + FDR at gene level 
+p.bh = mt.rawp2adjp(gene.DE$minJuncPvalue, "BH")
+gene.DE$padjGeneWise = p.bh$adjp[order(p.bh$index),2]
+gene.DE$DE_padjGW = ifelse(gene.DE$padjGeneWise < p_GW_th, 1, 0)
+
+pwf.padjGW = makespline(gene.DE$Njunc, gene.DE$DE_padjGW)
+gene.DE.pwf.padjGW = data.frame(DEgenes = gene.DE$DE_padjGW, bias.data = gene.DE$Njunc, pwf = pwf.padjGW)
+rownames(gene.DE.pwf.padjGW) = rownames(gene.DE)
+
+pway.padjGW.sampling = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway, method="Sampling", repcnt= n_perm_pway) 
+pway.padjGW.wallenius = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway, method="Wallenius") 
+pway.padjGW.hypergeo = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway, method="Hypergeometric") 
+pway.2.padjGW.sampling = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway.2, method="Sampling", repcnt= n_perm_pway) 
+pway.2.padjGW.wallenius = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway.2, method="Wallenius") 
+pway.2.padjGW.hypergeo = goseq(gene.DE.pwf.padjGW, gene2cat=gene2pway.2, method="Hypergeometric") 
+
+gg.padjGW.sampling = pwayEnrich_DEjunc(pway2gene, pway.padjGW.sampling, gene.DE, TT="minP+geneFDR\nSampling")
+gg.padjGW.wallenius = pwayEnrich_DEjunc(pway2gene, pway.padjGW.wallenius, gene.DE, TT="minP+geneFDR\nWallenius")
+gg.padjGW.hypergeo = pwayEnrich_DEjunc(pway2gene, pway.padjGW.hypergeo, gene.DE, TT="minP+geneFDR\nHypergeo")
+gg.2.padjGW.sampling = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW.sampling, gene.DE, TT="minP+geneFDR\nSampling")
+gg.2.padjGW.wallenius = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW.wallenius, gene.DE, TT="minP+geneFDR\nWallenius")
+gg.2.padjGW.hypergeo = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW.hypergeo, gene.DE, TT="minP+geneFDR\nHypergeo")
+
+# 3. DEXseq subfeature + FDR gene (2step)
+p.bh = mt.rawp2adjp(gene.DE$minP.bh, "BH")
+gene.DE$minP.bh.GeneWise = p.bh$adjp[order(p.bh$index),2]
+gene.DE$DE_padjGW_subf = ifelse(gene.DE$minP.bh.GeneWise < p_GW_subf_th, 1, 0)
+
+pwf.padjGW_subf = makespline(gene.DE$Njunc, gene.DE$DE_padjGW_subf)
+gene.DE.pwf.padjGW_subf = data.frame(DEgenes = gene.DE$DE_padjGW_subf, bias.data = gene.DE$Njunc, pwf = pwf.padjGW_subf)
+rownames(gene.DE.pwf.padjGW_subf) = rownames(gene.DE)
+
+pway.padjGW_subf.sampling = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway, method="Sampling", repcnt= n_perm_pway) 
+pway.padjGW_subf.wallenius = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway, method="Wallenius") 
+pway.padjGW_subf.hypergeo = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway, method="Hypergeometric") 
+pway.2.padjGW_subf.sampling = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway.2, method="Sampling", repcnt= n_perm_pway) 
+pway.2.padjGW_subf.wallenius = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway.2, method="Wallenius") 
+pway.2.padjGW_subf.hypergeo = goseq(gene.DE.pwf.padjGW_subf, gene2cat=gene2pway.2, method="Hypergeometric") 
+
+gg.padjGW_subf.sampling = pwayEnrich_DEjunc(pway2gene, pway.padjGW_subf.sampling, gene.DE, TT="minP_FDR+geneFDR\nSampling")
+gg.padjGW_subf.wallenius = pwayEnrich_DEjunc(pway2gene, pway.padjGW_subf.wallenius, gene.DE, TT="minP_FDR+geneFDR\nWallenius")
+gg.padjGW_subf.hypergeo = pwayEnrich_DEjunc(pway2gene, pway.padjGW_subf.hypergeo, gene.DE, TT="minP_FDR+geneFDR\nHypergeo")
+gg.2.padjGW_subf.sampling = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW_subf.sampling, gene.DE, TT="minP_FDR+geneFDR\nSampling")
+gg.2.padjGW_subf.wallenius = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW_subf.wallenius, gene.DE, TT="minP_FDR+geneFDR\nWallenius")
+gg.2.padjGW_subf.hypergeo = pwayEnrich_DEjunc(pway2gene.2, pway.2.padjGW_subf.hypergeo, gene.DE, TT="minP_FDR+geneFDR\nHypergeo")
+
+# 4. DEXseq FDRq (1step)
+tmp = perGeneQValue.2(data.sim.DE$pvalue, assigned.id)
+names(tmp) = paste0("gene_", names(tmp))
+gene.DE$FDRq = tmp[match(rownames(gene.DE), names(tmp))]
+gene.DE$DE_FDRq = ifelse(gene.DE$FDRq<p_GW_FDRq, 1, 0)
+
+pwf.FDRq = makespline(gene.DE$Njunc, gene.DE$DE_FDRq)
+gene.DE.pwf.FDRq = data.frame(DEgenes = gene.DE$DE_FDRq, bias.data = gene.DE$Njunc, pwf = pwf.FDRq)
+rownames(gene.DE.pwf.FDRq) = rownames(gene.DE)
+
+pway.FDRq.sampling = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway, method="Sampling", repcnt= n_perm_pway) 
+pway.FDRq.wallenius = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway, method="Wallenius") 
+pway.FDRq.hypergeo = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway, method="Hypergeometric") 
+pway.2.FDRq.sampling = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway.2, method="Sampling", repcnt= n_perm_pway) 
+pway.2.FDRq.wallenius = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway.2, method="Wallenius") 
+pway.2.FDRq.hypergeo = goseq(gene.DE.pwf.FDRq, gene2cat=gene2pway.2, method="Hypergeometric") 
+
+gg.FDRq.sampling = pwayEnrich_DEjunc(pway2gene, pway.FDRq.sampling, gene.DE, TT="DEXseq(FDRq)\nSampling")
+gg.FDRq.wallenius = pwayEnrich_DEjunc(pway2gene, pway.FDRq.wallenius, gene.DE, TT="DEXseq(FDRq)\nWallenius")
+gg.FDRq.hypergeo = pwayEnrich_DEjunc(pway2gene, pway.FDRq.hypergeo, gene.DE, TT="DEXseq(FDRq)\nHypergeo")
+gg.2.FDRq.sampling = pwayEnrich_DEjunc(pway2gene.2, pway.2.FDRq.sampling, gene.DE, TT="DEXseq(FDRq)\nSampling")
+gg.2.FDRq.wallenius = pwayEnrich_DEjunc(pway2gene.2, pway.2.FDRq.wallenius, gene.DE, TT="DEXseq(FDRq)\nWallenius")
+gg.2.FDRq.hypergeo = pwayEnrich_DEjunc(pway2gene.2, pway.2.FDRq.hypergeo, gene.DE, TT="DEXseq(FDRq)\nHypergeo")
+
+```
+
+###Simulation result: comparison of bias correction
+```{r, echo=FALSE, fig.width=10, fig.height=2.5}
+par(mfrow=c(1,4))
+plotPWF2.noprint(gene.DE.pwf.padjGW, binsize=20, TT = "minP+geneFDR")
+plotPWF2.noprint(gene.DE.pwf.padjGW_subf, binsize=20, TT = "minP_FDR+geneFDR")
+plotPWF2.noprint(gene.DE.pwf.FDRq, binsize=20, TT = "DEXseq(FDRq)")
+plotPWF2.noprint(gene.DE.pwf.padjByNjunc, binsize=20, TT = "Proposed")
+```
+
+###Simulation result: correlation between enrichment and number of junctions (Scenario 1)
+```{r, echo=FALSE}
+# plot all figures for scenario 1
+#dev.new(width=16, height=8)
+multiplot(gg.padjGW.hypergeo, gg.padjGW.wallenius, gg.padjGW.sampling, 
+          gg.padjGW_subf.hypergeo, gg.padjGW_subf.wallenius, gg.padjGW_subf.sampling, 
+          gg.FDRq.hypergeo, gg.FDRq.wallenius, gg.FDRq.sampling, 
+          gg.padjByNjunc.hypergeo, gg.padjByNjunc.wallenius, gg.padjByNjunc.sampling, cols=4)
+```
+
+###Simulation result: correlation between enrichment and number of junctions (Scenario 2)
+```{r, echo=FALSE}
+# plot all figures for scenario 2
+#dev.new(width=16, height=8)
+multiplot(gg.2.padjGW.hypergeo, gg.2.padjGW.wallenius, gg.2.padjGW.sampling, 
+          gg.2.padjGW_subf.hypergeo, gg.2.padjGW_subf.wallenius, gg.2.padjGW_subf.sampling, 
+          gg.2.FDRq.hypergeo, gg.2.FDRq.wallenius, gg.2.FDRq.sampling, 
+          gg.2.padjByNjunc.hypergeo, gg.2.padjByNjunc.wallenius, gg.2.padjByNjunc.sampling, cols=4)
+```
+
